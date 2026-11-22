@@ -596,6 +596,7 @@ void main() {
             contentVersion: 'v1',
           ),
           baseline: false,
+          readerRole: 'dad',
         );
       }
       await store.markRead(topicId: 'a');

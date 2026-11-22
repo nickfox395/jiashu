@@ -21,7 +21,7 @@ class Alerts {
     await android?.createNotificationChannel(
       const AndroidNotificationChannel(
         'letters',
-        '孩子的新消息',
+        '家书新消息',
         description: '新消息声音、振动和横幅提醒',
         importance: Importance.high,
         playSound: true,
@@ -53,7 +53,7 @@ class Alerts {
       const NotificationDetails(
         android: AndroidNotificationDetails(
           'letters',
-          '孩子的新消息',
+          '家书新消息',
           importance: Importance.high,
           priority: Priority.high,
           icon: 'ic_bg_service_small',
@@ -82,7 +82,7 @@ class Alerts {
       const NotificationDetails(
         android: AndroidNotificationDetails(
           'letters',
-          '孩子的新消息',
+          '家书新消息',
           importance: Importance.high,
           priority: Priority.high,
           visibility: NotificationVisibility.private,

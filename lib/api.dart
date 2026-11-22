@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:typed_data';
 import 'package:crypto/crypto.dart';
@@ -26,18 +27,33 @@ class SchoolApi {
     String role,
     bool allowHttp, {
     http.Client? httpClient,
+    String? previousBase,
   }) async {
     if (!RegExp(r'^[a-zA-Z0-9_-]{1,40}$').hasMatch(school)) {
       throw const ApiFailure('请输入正确的学校代码');
     }
     final client = httpClient ?? http.Client();
     try {
-      final discovery = await client
-          .get(Uri.https('hagateway.zyai.cc', '/api/discovery/$school'))
-          .timeout(const Duration(seconds: 20));
-      if (discovery.statusCode != 200) throw const ApiFailure('未找到学校，请检查学校代码');
-      final data = jsonDecode(utf8.decode(discovery.bodyBytes));
-      final base = Uri.tryParse('${data['server']}');
+      http.Response? discovery;
+      try {
+        discovery = await client
+            .get(Uri.https('hagateway.zyai.cc', '/api/discovery/$school'))
+            .timeout(const Duration(seconds: 20));
+      } on http.ClientException {
+        if (previousBase == null) rethrow;
+      } on TimeoutException {
+        if (previousBase == null) rethrow;
+      }
+      String? address = previousBase;
+      if (discovery != null) {
+        if (discovery.statusCode == 200) {
+          final data = jsonDecode(utf8.decode(discovery.bodyBytes));
+          address = data['server'] as String?;
+        } else if (discovery.statusCode < 500 || previousBase == null) {
+          throw const ApiFailure('无法查询学校，请检查学校代码或稍后重试');
+        }
+      }
+      final base = Uri.tryParse(address ?? '');
       if (base == null ||
           !['http', 'https'].contains(base.scheme) ||
           base.userInfo.isNotEmpty ||
@@ -73,7 +89,17 @@ class SchoolApi {
       }
       final envelope = jsonDecode(utf8.decode(response.bodyBytes));
       if (envelope is Map && envelope['success'] == false) {
-        throw const LoginRequired('账号或密码未被接受，请重新登录；如需验证请先使用官方 App');
+        final error = envelope['error'];
+        final reason = error is Map
+            ? '${error['message']} ${error['details']}'
+            : '';
+        if (RegExp(
+          r'密码错误|密码不正确|用户名或密码|账号或密码|身份验证|短信验证|invalid (user|password|credential)|incorrect password',
+          caseSensitive: false,
+        ).hasMatch(reason)) {
+          throw const LoginRequired('请检查账号密码或在官方 App 完成验证后重新登录');
+        }
+        throw const ApiFailure('登录服务暂未完成请求，请稍后重试');
       }
       final result = unwrap(response.statusCode, envelope);
       if (result is Map &&

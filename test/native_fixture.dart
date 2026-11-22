@@ -27,7 +27,7 @@ class NativeFixture {
   int registrations = 0, tokens = 0;
   bool loseFinalResponse = false, failOneUpload = false;
   bool losePublicationResponse = false, rejectPublication = false;
-  bool loseResourceResponse = false;
+  bool loseResourceResponse = false, stalePreview = false;
   void Function()? beforeNoteRead;
   SchoolApi api(Session session) => SchoolApi(
     session,
@@ -42,6 +42,15 @@ class NativeFixture {
         }),
         200,
       );
+      if (request.method == 'GET' &&
+          request.url.host == 'ezy-test.oss-cn-hangzhou.aliyuncs.com') {
+        final bytes = stalePreview
+            ? Uint8List.fromList([0])
+            : objects[request.url.path];
+        return bytes == null
+            ? http.Response('', 404)
+            : http.Response.bytes(bytes, 200);
+      }
       if (request.method == 'PUT') {
         expect(request.url.scheme, 'https');
         expect(request.followRedirects, false);

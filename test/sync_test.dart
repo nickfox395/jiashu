@@ -3,6 +3,7 @@ import 'dart:ffi';
 import 'dart:io';
 import 'dart:typed_data';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:crypto/crypto.dart';
 import 'package:http/http.dart' as http;
 import 'package:http/testing.dart';
 import 'package:sqflite_common_ffi/sqflite_ffi.dart';
@@ -59,31 +60,57 @@ void main() {
     bodyDigest: version,
   );
   test('Baseline is silent; changed child messages alert once', () async {
-    expect(await store.ingest(child('v1'), baseline: true), false);
-    expect(await store.ingest(child('v1'), baseline: false), false);
-    expect(await store.ingest(child('v2'), baseline: false), true);
+    expect(
+      await store.ingest(child('v1'), baseline: true, readerRole: 'dad'),
+      false,
+    );
+    expect(
+      await store.ingest(child('v1'), baseline: false, readerRole: 'dad'),
+      false,
+    );
+    expect(
+      await store.ingest(child('v2'), baseline: false, readerRole: 'dad'),
+      true,
+    );
     expect(
       (await store.messages()).singleWhere((m) => m.isUpdate).unread,
       true,
     );
-    expect(await store.ingest(child('v2'), baseline: false), false);
+    expect(
+      await store.ingest(child('v2'), baseline: false, readerRole: 'dad'),
+      false,
+    );
     await store.markRead();
     expect((await store.get('a'))!.unread, false);
   });
   test(
-    'Own messages never trigger child alert; accounts stay isolated',
+    'Every other sender is unread once, own messages and baseline stay quiet',
     () async {
-      expect(
-        await store.ingest(
-          Message(id: 'a', role: 'mom', text: '你好', time: 1),
-          baseline: false,
-        ),
-        false,
-      );
+      for (final reader in ['dad', 'mom']) {
+        for (final sender in ['dad', 'mom', 'child']) {
+          final m = Message(
+            id: '$reader-$sender',
+            role: sender,
+            text: '你好',
+            time: 1,
+          );
+          expect(
+            await store.ingest(m, baseline: false, readerRole: reader),
+            sender != reader,
+          );
+          expect((await store.get(m.id))!.unread, sender != reader);
+          await store.markMessageRead(m.id);
+          expect(
+            await store.ingest(m, baseline: false, readerRole: reader),
+            false,
+          );
+          expect((await store.get(m.id))!.unread, false);
+        }
+      }
       final other = Store(db, 'another:123');
       expect(await other.messages(), isEmpty);
       await other.put(child('v1'));
-      expect((await store.get('a'))!.role, 'mom');
+      expect(await store.get('a'), isNull);
     },
   );
   test('Lease rejects competing foreground/background sync', () async {
@@ -195,6 +222,77 @@ void main() {
     },
   );
   test(
+    'Queued revisions survive a lost response and a retry uploads the latest local page',
+    () async {
+      final server = NativeFixture();
+      await store.set('folder', 'root');
+      final sync = SyncEngine(session, store, apiFactory: server.api);
+      final id = await sync.enqueue('连续修改');
+      await sync.run();
+      final note = (await store.get(id))!;
+      final original = server.objects[Uri.parse(note.images.single).path]!;
+      final first = Uint8List.fromList([1, 2, 3]);
+      final second = Uint8List.fromList([4, 5, 6]);
+      await store.queuePage(
+        note,
+        0,
+        md5.convert(original).toString(),
+        null,
+        first,
+      );
+      final revision = (await store.localPage(note, 0))!.revision;
+      server.loseResourceResponse = true;
+      await sync.run();
+      expect(await store.pendingPageEdits(), hasLength(1));
+      await store.queuePage(
+        note,
+        0,
+        md5.convert(first).toString(),
+        revision,
+        second,
+      );
+      final restart = Store(db, session.account);
+      expect((await restart.localPage(note, 0))!.bytes, second);
+      await SyncEngine(session, restart, apiFactory: server.api).run();
+      expect(await restart.queuedPages(), isEmpty);
+      final saved = (await restart.get(id))!;
+      expect(server.objects[Uri.parse(saved.images.single).path], second);
+      expect((await restart.localPage(saved, 0))!.pending, isFalse);
+      expect(server.tokens, 3); // Original plus two distinct saves.
+    },
+  );
+
+  test(
+    'A cloud conflict preserves the local page without overwriting the other edit',
+    () async {
+      final server = NativeFixture();
+      await store.set('folder', 'root');
+      final sync = SyncEngine(session, store, apiFactory: server.api);
+      final id = await sync.enqueue('云端同时修改');
+      await sync.run();
+      final note = (await store.get(id))!;
+      final bytes = Uint8List.fromList([3, 2, 1]);
+      final original = server.objects[Uri.parse(note.images.single).path]!;
+      await store.queuePage(
+        note,
+        0,
+        md5.convert(original).toString(),
+        null,
+        bytes,
+      );
+      server.resources.first['md5'] = 'changed remotely';
+      final writes = server.tokens;
+      await sync.run();
+      final kept = (await store.localPage(note, 0))!;
+      expect(kept.bytes, bytes);
+      expect(kept.error, contains('已被修改'));
+      expect(server.tokens, writes);
+      await store.clearHistory();
+      expect(await store.queuedPages(), isEmpty);
+    },
+  );
+
+  test(
     'Edit the second page of a child note and reconcile a lost save response',
     () async {
       final fixture = NativeFixture();
@@ -237,8 +335,19 @@ void main() {
         throwsA(isA<http.ClientException>()),
       );
       final writes = List.of(fixture.order);
+      fixture.stalePreview = true;
+      await expectLater(
+        edit.save(session, store, png, apiFactory: fixture.api),
+        throwsA(isA<ApiFailure>()),
+      );
+      expect((await store.get(id))!.images, child.images);
+      fixture.stalePreview = false;
       await edit.save(session, store, png, apiFactory: fixture.api);
       expect(fixture.order, writes);
+      final reopened = (await Store(db, session.account).get(id))!;
+      expect(reopened.images.first, child.images.first);
+      expect(reopened.images[1], isNot(child.images[1]));
+      expect(fixture.objects[Uri.parse(reopened.images[1]).path], png);
       expect(fixture.notes.last['fileName'], '孩子的笔记');
       expect(fixture.notes.last['parentId'], 'root');
       expect(fixture.notes.last['fileId'], id);

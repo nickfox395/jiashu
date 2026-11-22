@@ -259,6 +259,7 @@ class SyncEngine {
             status: pending ? 'uncertain' : 'synced',
           ),
           baseline: baseline,
+          readerRole: session.role,
         )) {
           incoming++;
         }
@@ -388,6 +389,7 @@ class SyncEngine {
               ),
             ),
             baseline: true,
+            readerRole: session.role,
           );
           pending.remove(m);
           progressed = true;
@@ -397,6 +399,49 @@ class SyncEngine {
             await store.put(m.withStatus('conflict'));
           }
           break; // Locally corrupt/cyclic parent dependencies cannot loop forever.
+        }
+      }
+      final blockedNotes = <String>{};
+      for (final job in await store.queuedPages()) {
+        final id = job['remoteId'] as String,
+            revision = job['revision'] as String;
+        if (blockedNotes.contains(id) ||
+            await store.setting('edit-index:$id') != null) {
+          continue;
+        }
+        await checkpoint();
+        try {
+          final note = await store.get(job['noteId'] as String);
+          if (note == null ||
+              !note.canEdit ||
+              note.remoteId != id ||
+              note.topicId != job['topic']) {
+            throw const ApiFailure('云端笔记已移动或不可用，本机修改仍保留');
+          }
+          final edit = NotePageEdit.queued(
+            note,
+            job['baseUrl'] as String,
+            job['baseMd5'] as String,
+            revision,
+            job['predecessor'] as String?,
+          );
+          await edit.upload(
+            api,
+            store,
+            await store.pageBytes(store.db, revision),
+            checkpoint,
+          );
+        } on LoginRequired {
+          rethrow;
+        } catch (e) {
+          blockedNotes.add(id);
+          warnings++;
+          await store.db.update(
+            'page_edits',
+            {'error': e is ApiFailure ? e.message : '网络不可用，稍后重试'},
+            where: 'account=? AND revision=?',
+            whereArgs: [store.account, revision],
+          );
         }
       }
       await store.set('lastSync', DateTime.now().toIso8601String());

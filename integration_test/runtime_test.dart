@@ -197,6 +197,7 @@ void main() {
           contentVersion: 'continued-writing',
         ),
         baseline: false,
+        readerRole: s.role,
       ),
       true,
     );
@@ -292,6 +293,7 @@ void main() {
           contentVersion: 'after-deletion',
         ),
         baseline: false,
+        readerRole: s.role,
       ),
       false,
     );

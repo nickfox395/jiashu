@@ -224,18 +224,22 @@ void main() {
         throw const SocketException('private-server-error');
       }
 
-      await expectLater(
-        coordinator(action: offline).authorize(null),
-        throwsA(isA<ApiFailure>()),
-      );
-      await expectLater(
-        coordinator(action: offline).authorize(null),
-        throwsA(isA<ApiFailure>()),
-      );
+      expect(await coordinator(action: offline).authorize(null), same(initial));
+      expect(await coordinator(action: offline).authorize(null), same(initial));
       expect(logins, 1);
       clock = clock.add(const Duration(seconds: 61));
-      await coordinator().authorize(null);
+      await expectLater(
+        coordinator(action: offline).authorize(null),
+        throwsA(isA<ApiFailure>()),
+      );
+      await expectLater(
+        coordinator(action: offline).authorize(null),
+        throwsA(isA<ApiFailure>()),
+      );
       expect(logins, 2);
+      clock = clock.add(const Duration(seconds: 121));
+      await coordinator().authorize(null);
+      expect(logins, 3);
     },
   );
 
@@ -345,6 +349,39 @@ void main() {
           ),
         ),
       );
+      client.close();
+    },
+  );
+
+  test(
+    'A discovery outage can reuse the saved school address; a rejected school cannot',
+    () async {
+      var status = 503, posts = 0;
+      final client = MockClient((request) async {
+        if (request.method == 'GET') return http.Response('', status);
+        expect(request.url.host, 'test.zykj.org');
+        posts++;
+        return http.Response(
+          jsonEncode({
+            'success': true,
+            'result': {'roleType': 1, 'accessToken': fresh().token},
+          }),
+          200,
+        );
+      });
+      Future<Session> recover() => SchoolApi.login(
+        'test',
+        'fixture',
+        'fixture-password',
+        'dad',
+        false,
+        httpClient: client,
+        previousBase: initial.base,
+      );
+      expect((await recover()).userId, initial.userId);
+      status = 404;
+      await expectLater(recover(), throwsA(isA<ApiFailure>()));
+      expect(posts, 1);
       client.close();
     },
   );

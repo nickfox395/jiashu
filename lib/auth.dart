@@ -44,7 +44,16 @@ class AuthCoordinator {
     DateTime Function()? now,
     this.checkpoint,
   }) : credentials = credentials ?? DeviceCredentials(),
-       login = login ?? SchoolApi.login,
+       login =
+           login ??
+           ((school, user, password, role, allowHttp) => SchoolApi.login(
+             school,
+             user,
+             password,
+             role,
+             allowHttp,
+             previousBase: initial.base,
+           )),
        now = now ?? DateTime.now;
 
   String get key => 'auth:${initial.loginId}';
@@ -87,13 +96,22 @@ class AuthCoordinator {
       throw const ApiFailure('登录状态已更改，本次同步已停止');
     }
     final blocked = await store.setting('$key:blocked');
-    if (blocked != null && blocked.isNotEmpty) throw LoginRequired(blocked);
+    // Older versions permanently blocked every unsuccessful business response,
+    // including temporary service failures. Re-evaluate that legacy reason once.
+    if (blocked == '账号或密码未被接受，请重新登录；如需验证请先使用官方 App') {
+      await store.set('$key:blocked', '');
+    } else if (blocked != null && blocked.isNotEmpty) {
+      throw LoginRequired(blocked);
+    }
     final current = saved.session;
     final expiry = expiresAt(current.token);
     final nearExpiry =
         expiry != null &&
         !expiry.isAfter(now().add(const Duration(minutes: 2)));
     final rejected = rejectedToken != null && current.token == rejectedToken;
+    final stillValid =
+        rejectedToken == null && expiry != null && expiry.isAfter(now());
+    if (stillValid && current.token == _renewedToken) return current;
     if (rejected && current.token == _renewedToken) {
       await rejectedAfterLogin();
       throw const LoginRequired('自动登录后仍被拒绝，请重新登录或在官方 App 完成验证');
@@ -104,6 +122,7 @@ class AuthCoordinator {
     }
     final next = int.tryParse(await store.setting('$key:next') ?? '0') ?? 0;
     if (next > now().millisecondsSinceEpoch) {
+      if (stillValid) return current;
       throw const ApiFailure('自动登录暂未成功，稍后将自动重试');
     }
     // Persist before networking: an interrupted process must not cause a loop.
@@ -144,6 +163,12 @@ class AuthCoordinator {
         '$key:next',
         '${now().millisecondsSinceEpoch + seconds * 1000}',
       );
+      if (stillValid &&
+          expiry.isAfter(now()) &&
+          (await credentials.read())?.session.loginId == current.loginId) {
+        await checkpoint?.call();
+        return current;
+      }
       throw const ApiFailure('自动登录暂未成功，稍后将自动重试');
     }
   }

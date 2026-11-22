@@ -19,17 +19,25 @@ Future<void> main() async {
   await Alerts.init();
   await configureBackground();
   Session? session;
+  var restoreFailed = false;
   try {
     session = await Vault.read();
   } catch (_) {
-    await Vault.clear();
+    // Android secure storage can be temporarily unavailable on startup.
+    await Future<void>.delayed(const Duration(milliseconds: 350));
+    try {
+      session = await Vault.read();
+    } catch (_) {
+      restoreFailed = true;
+    }
   }
-  runApp(JiashuApp(initial: session));
+  runApp(JiashuApp(initial: session, restoreFailed: restoreFailed));
 }
 
 class JiashuApp extends StatefulWidget {
   final Session? initial;
-  const JiashuApp({super.key, this.initial});
+  final bool restoreFailed;
+  const JiashuApp({super.key, this.initial, this.restoreFailed = false});
   @override
   State<JiashuApp> createState() => _JiashuAppState();
 }
@@ -68,7 +76,10 @@ class _JiashuAppState extends State<JiashuApp> {
       ),
     ),
     home: session == null
-        ? LoginPage(onLogin: (s) => setState(() => session = s))
+        ? LoginPage(
+            restoreFailed: widget.restoreFailed,
+            onLogin: (s) => setState(() => session = s),
+          )
         : ChatPage(
             key: ValueKey(session!.account),
             session: session!,
@@ -79,7 +90,12 @@ class _JiashuAppState extends State<JiashuApp> {
 
 class LoginPage extends StatefulWidget {
   final ValueChanged<Session> onLogin;
-  const LoginPage({super.key, required this.onLogin});
+  final bool restoreFailed;
+  const LoginPage({
+    super.key,
+    required this.onLogin,
+    this.restoreFailed = false,
+  });
   @override
   State<LoginPage> createState() => _LoginPageState();
 }
@@ -89,7 +105,64 @@ class _LoginPageState extends State<LoginPage> {
       username = TextEditingController(),
       password = TextEditingController();
   String role = 'dad', error = '';
-  bool allowHttp = false, busy = false, obscure = true;
+  bool allowHttp = false, busy = false, obscure = true, remember = true;
+  bool restoring = true, restoreError = false;
+
+  @override
+  void initState() {
+    super.initState();
+    restoreForm();
+  }
+
+  Future<void> restoreForm() async {
+    setState(() {
+      restoring = true;
+      restoreError = false;
+      error = '';
+    });
+    try {
+      if (widget.restoreFailed) {
+        final session = await Vault.read();
+        if (!mounted) return;
+        if (session != null) {
+          widget.onLogin(session);
+          return;
+        }
+      }
+      final form = await Vault.readForm();
+      if (!mounted || form == null) return;
+      school.text = form['school'] as String? ?? '';
+      username.text = form['username'] as String? ?? '';
+      password.text = form['password'] as String? ?? '';
+      role = form['role'] == 'mom' ? 'mom' : 'dad';
+      allowHttp = form['allowHttp'] == true;
+      remember = form['remember'] != false;
+    } catch (_) {
+      if (mounted) {
+        restoreError = true;
+        error = '暂时无法读取保存的登录信息，请解锁手机后重试';
+      }
+    } finally {
+      if (mounted) setState(() => restoring = false);
+    }
+  }
+
+  Future<void> changeRemember(bool? value) async {
+    if (value == true) {
+      setState(() => remember = true);
+      return;
+    }
+    setState(() => busy = true);
+    try {
+      await Vault.forgetForm();
+      if (mounted) setState(() => remember = false);
+    } catch (_) {
+      if (mounted) setState(() => error = '未能清除保存的登录信息，请重试');
+    } finally {
+      if (mounted) setState(() => busy = false);
+    }
+  }
+
   @override
   void dispose() {
     school.dispose();
@@ -99,7 +172,7 @@ class _LoginPageState extends State<LoginPage> {
   }
 
   Future<void> login() async {
-    if (busy) return;
+    if (busy || restoring) return;
     if (username.text.trim().isEmpty || password.text.isEmpty) {
       setState(() => error = '请填写学生账号和密码');
       return;
@@ -109,6 +182,15 @@ class _LoginPageState extends State<LoginPage> {
       error = '';
     });
     try {
+      if (remember) {
+        await Vault.rememberForm(
+          school.text.trim().toLowerCase(),
+          username.text.trim(),
+          role,
+          password.text,
+          allowHttp,
+        );
+      }
       final s = await SchoolApi.login(
         school.text.trim().toLowerCase(),
         username.text.trim(),
@@ -116,8 +198,18 @@ class _LoginPageState extends State<LoginPage> {
         role,
         allowHttp,
       );
-      await Vault.save(s, password: password.text, allowHttp: allowHttp);
-      await Alerts.plugin.cancel(101);
+      await Vault.save(
+        s,
+        password: password.text,
+        allowHttp: allowHttp,
+        remember: remember,
+      );
+      // Notification cleanup cannot invalidate a successfully persisted login.
+      try {
+        await Alerts.plugin.cancel(101);
+      } on PlatformException {
+        // Android may disable notifications independently of the school session.
+      }
       password.clear();
       if (mounted) widget.onLogin(s);
     } catch (e) {
@@ -186,14 +278,14 @@ class _LoginPageState extends State<LoginPage> {
                     ),
                   ],
                   selected: {role},
-                  onSelectionChanged: busy
+                  onSelectionChanged: busy || restoring
                       ? null
                       : (v) => setState(() => role = v.first),
                 ),
                 const SizedBox(height: 22),
                 TextField(
                   controller: school,
-                  enabled: !busy,
+                  enabled: !busy && !restoring,
                   autocorrect: false,
                   decoration: const InputDecoration(
                     labelText: '学校代码',
@@ -204,7 +296,7 @@ class _LoginPageState extends State<LoginPage> {
                 const SizedBox(height: 14),
                 TextField(
                   controller: username,
-                  enabled: !busy,
+                  enabled: !busy && !restoring,
                   autocorrect: false,
                   decoration: const InputDecoration(
                     labelText: '学生账号',
@@ -214,7 +306,7 @@ class _LoginPageState extends State<LoginPage> {
                 const SizedBox(height: 14),
                 TextField(
                   controller: password,
-                  enabled: !busy,
+                  enabled: !busy && !restoring,
                   obscureText: obscure,
                   autocorrect: false,
                   enableSuggestions: false,
@@ -236,8 +328,15 @@ class _LoginPageState extends State<LoginPage> {
                 CheckboxListTile(
                   contentPadding: EdgeInsets.zero,
                   controlAffinity: ListTileControlAffinity.leading,
+                  value: remember,
+                  onChanged: busy || restoring ? null : changeRemember,
+                  title: const Text('记住登录信息'),
+                ),
+                CheckboxListTile(
+                  contentPadding: EdgeInsets.zero,
+                  controlAffinity: ListTileControlAffinity.leading,
                   value: allowHttp,
-                  onChanged: busy
+                  onChanged: busy || restoring
                       ? null
                       : (v) => setState(() => allowHttp = v ?? false),
                   title: const Text(
@@ -245,10 +344,15 @@ class _LoginPageState extends State<LoginPage> {
                     style: TextStyle(fontSize: 13),
                   ),
                   subtitle: const Text(
-                    '密码和消息可能被网络中间方读取。本机密码加密保存，用于自动登录。',
+                    '密码和消息可能被网络中间方读取。',
                     style: TextStyle(fontSize: 12),
                   ),
                 ),
+                if (restoreError)
+                  TextButton(
+                    onPressed: busy || restoring ? null : restoreForm,
+                    child: const Text('重新读取登录信息'),
+                  ),
                 if (error.isNotEmpty)
                   Padding(
                     padding: const EdgeInsets.only(bottom: 12),
@@ -260,7 +364,7 @@ class _LoginPageState extends State<LoginPage> {
                 SizedBox(
                   width: double.infinity,
                   child: FilledButton(
-                    onPressed: busy ? null : login,
+                    onPressed: busy || restoring ? null : login,
                     child: busy
                         ? const SizedBox(
                             width: 22,
@@ -293,6 +397,8 @@ class ChatPage extends StatefulWidget {
 }
 
 class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
+  final noteChanges = ValueNotifier<int>(0);
+  bool syncAfterSave = false;
   Store? store;
   final composer = TextEditingController(),
       scroll = ScrollController(keepScrollOffset: false);
@@ -371,6 +477,7 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
     WidgetsBinding.instance.removeObserver(this);
     composer.dispose();
     scroll.dispose();
+    noteChanges.dispose();
     super.dispose();
   }
 
@@ -397,6 +504,7 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
           ? '尚未同步'
           : timeLabel(DateTime.parse(ls).millisecondsSinceEpoch);
     });
+    noteChanges.value++;
   }
 
   Future<void> sync() async {
@@ -416,7 +524,13 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
         if (foreground) announce(result.incoming);
       }
     } finally {
-      if (mounted && active) setState(() => syncing = false);
+      if (mounted && active) {
+        setState(() => syncing = false);
+        if (syncAfterSave) {
+          syncAfterSave = false;
+          unawaited(sync());
+        }
+      }
     }
   }
 
@@ -434,10 +548,10 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
         ),
         content: Text(
           m.isTopic
-              ? '仅从本机家书移除“${m.text}”及其中的全部子目录、消息和更新提醒，云笔记原件保留。\n\n其中的待发消息将停止发送或重试；后续同步也不会重新显示这个目录。'
+              ? '仅从本机家书移除“${m.text}”及其中的全部子目录、消息和更新提醒，云笔记原件保留。\n\n未同步的正文修改会从本机清除，待发消息会取消。后续同步也不会重新显示这个目录。'
               : m.isUpdate
               ? '仅从本机家书移除这条提醒，原消息和云笔记保留。之后笔记再次更新仍会提醒。'
-              : '仅从本机家书移除这条消息及关联的更新提醒，云笔记原件保留。\n\n待发消息将停止发送或重试；发送结果未确认的消息可能已经保存在云笔记。',
+              : '仅从本机家书移除这条消息及关联的更新提醒，云笔记原件保留。\n\n未同步的正文修改会从本机清除，待发消息会取消。发送结果未确认的消息可能已经保存在云笔记。',
         ),
         actions: [
           TextButton(
@@ -499,7 +613,7 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
       builder: (context) => AlertDialog(
         title: const Text('清空聊天记录？'),
         content: const Text(
-          '清空本机当前账号在所有话题中的消息和更新提醒，并取消待发消息。云端原件、话题目录和草稿保留，之后仍可接收新消息。',
+          '清空本机当前账号在所有话题中的消息和更新提醒，并清除未同步的正文修改、取消待发消息。云端原件、话题目录和草稿保留，之后仍可接收新消息。',
         ),
         actions: [
           TextButton(
@@ -1085,15 +1199,23 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
     );
   }
 
-  Future<void> readNote(Message note, Message message) =>
-      Navigator.of(context).push<void>(
-        MaterialPageRoute(
-          builder: (_) => _NoteReader(
-            pages: note.images,
-            onRead: message.unread ? () => markMessageRead(message) : null,
-          ),
+  Future<void> readNote(Message note, Message message) async {
+    final current = await store!.get(note.id);
+    if (!mounted || !active || current == null || current.images.isEmpty) {
+      return;
+    }
+    await Navigator.of(context).push<void>(
+      MaterialPageRoute(
+        builder: (_) => _NoteReader(
+          note: current,
+          store: store!,
+          changes: noteChanges,
+          editPage: editPage,
+          onRead: message.unread ? () => markMessageRead(message) : null,
         ),
-      );
+      ),
+    );
+  }
 
   Future<void> editNote(Message note) async {
     final index = note.images.length == 1
@@ -1113,22 +1235,27 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
             ),
           );
     if (index == null || !mounted || !active) return;
+    await editPage(note, index);
+  }
+
+  Future<Message?> editPage(Message note, int index) async {
     final saved = await Navigator.of(context).push<bool>(
       MaterialPageRoute(
-        builder: (_) => NoteEditor(
-          session: session,
-          store: store!,
-          note: note,
-          pageIndex: index,
-        ),
+        builder: (_) => NoteEditor(store: store!, note: note, pageIndex: index),
       ),
     );
     if (saved == true && mounted && active) {
       ScaffoldMessenger.of(
         context,
-      ).showSnackBar(const SnackBar(content: Text('正文页面已保存')));
-      await refresh();
+      ).showSnackBar(const SnackBar(content: Text('已保存到本机，等待同步')));
+      if (syncing) {
+        syncAfterSave = true;
+      } else {
+        unawaited(sync());
+      }
+      return note;
     }
+    return null;
   }
 
   Widget bubble(Message m) {
@@ -1203,10 +1330,7 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
                           value: 'view',
                           child: Text('查看笔记正文'),
                         ),
-                      if (page.kind == 'note' &&
-                          !page.deleted &&
-                          page.status == 'synced' &&
-                          page.images.isNotEmpty)
+                      if (page.canEdit)
                         const PopupMenuItem(
                           value: 'edit',
                           child: Text('修改笔记正文'),
@@ -1281,57 +1405,167 @@ Widget withUnreadStar(Message message, Widget text) {
 }
 
 class _NoteReader extends StatefulWidget {
-  final List<String> pages;
+  final Message note;
+  final Store store;
+  final ValueNotifier<int> changes;
+  final Future<Message?> Function(Message note, int index) editPage;
   final VoidCallback? onRead;
-  const _NoteReader({required this.pages, this.onRead});
+  const _NoteReader({
+    required this.note,
+    required this.store,
+    required this.changes,
+    required this.editPage,
+    this.onRead,
+  });
 
   @override
   State<_NoteReader> createState() => _NoteReaderState();
 }
 
 class _NoteReaderState extends State<_NoteReader> {
+  late Message note = widget.note;
   int index = 0;
-  bool displayed = false;
+
+  LocalPage? local;
+  bool loading = true, displayed = false;
+  int generation = 0;
+
+  @override
+  void initState() {
+    super.initState();
+    widget.changes.addListener(reload);
+    reload();
+  }
+
+  @override
+  void dispose() {
+    widget.changes.removeListener(reload);
+    super.dispose();
+  }
+
+  Future<void> reload() async {
+    final request = ++generation;
+    final current = await widget.store.get(note.id) ?? note;
+    if (!mounted || request != generation || current.images.isEmpty) return;
+    final page = index.clamp(0, current.images.length - 1);
+    final draft = await widget.store.localPage(current, page);
+    if (!mounted || request != generation) return;
+    setState(() {
+      note = current;
+      index = page;
+      local = draft;
+      loading = false;
+    });
+  }
+
+  void goTo(int page) {
+    setState(() {
+      index = page;
+      local = null;
+      loading = true;
+    });
+    reload();
+  }
+
+  Future<void> edit() async {
+    final saved = await widget.editPage(note, index);
+    if (mounted && saved != null) await reload();
+  }
 
   @override
   Widget build(BuildContext context) => Scaffold(
-    appBar: AppBar(
-      title: Text('笔记正文 · 第 ${index + 1} 页'),
-      actions: [
-        if (widget.pages.length > 1) ...[
-          IconButton(
-            tooltip: '上一页',
-            onPressed: index == 0 ? null : () => setState(() => index--),
-            icon: const Icon(Icons.chevron_left),
+    body: SafeArea(
+      child: Column(
+        children: [
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 4),
+            child: Row(
+              children: [
+                const BackButton(),
+                Expanded(
+                  child: Semantics(
+                    header: true,
+                    namesRoute: true,
+                    child: ConstrainedBox(
+                      constraints: BoxConstraints(
+                        maxHeight: MediaQuery.sizeOf(context).height / 3,
+                      ),
+                      child: SingleChildScrollView(
+                        child: Text(
+                          note.text,
+                          style: Theme.of(context).textTheme.titleLarge,
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+                if (note.canEdit)
+                  TextButton(
+                    onPressed: loading ? null : edit,
+                    child: const Text('修改'),
+                  ),
+              ],
+            ),
           ),
-          IconButton(
-            tooltip: '下一页',
-            onPressed: index + 1 == widget.pages.length
-                ? null
-                : () => setState(() => index++),
-            icon: const Icon(Icons.chevron_right),
+          Expanded(
+            child: Center(
+              child: loading
+                  ? const CircularProgressIndicator()
+                  : InteractiveViewer(
+                      key: ValueKey((
+                        index,
+                        local?.revision ?? note.contentVersion,
+                      )),
+                      minScale: .5,
+                      maxScale: 5,
+                      child: Image(
+                        image: local == null
+                            ? NetworkImage(note.images[index])
+                            : MemoryImage(local!.bytes),
+                        frameBuilder: (context, child, frame, _) {
+                          if (frame != null && !displayed) {
+                            displayed = true;
+                            WidgetsBinding.instance.addPostFrameCallback((_) {
+                              if (mounted) widget.onRead?.call();
+                            });
+                          }
+                          return child;
+                        },
+                        errorBuilder: (_, _, _) => const Text('图片加载失败，请检查网络'),
+                      ),
+                    ),
+            ),
           ),
+          if (local != null)
+            Text(
+              local!.pending
+                  ? (local!.error == null
+                        ? '已保存到本机，等待同步'
+                        : '已保存到本机 · ${local!.error}')
+                  : '已同步',
+              textAlign: TextAlign.center,
+              style: Theme.of(context).textTheme.bodySmall,
+            ),
+          if (note.images.length > 1)
+            Row(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                IconButton(
+                  tooltip: '上一页',
+                  onPressed: index == 0 ? null : () => goTo(index - 1),
+                  icon: const Icon(Icons.chevron_left),
+                ),
+                Text('${index + 1}/${note.images.length}'),
+                IconButton(
+                  tooltip: '下一页',
+                  onPressed: index + 1 == note.images.length
+                      ? null
+                      : () => goTo(index + 1),
+                  icon: const Icon(Icons.chevron_right),
+                ),
+              ],
+            ),
         ],
-      ],
-    ),
-    body: Center(
-      child: InteractiveViewer(
-        key: ValueKey(index),
-        minScale: .5,
-        maxScale: 5,
-        child: Image.network(
-          widget.pages[index],
-          frameBuilder: (context, child, frame, _) {
-            if (frame != null && !displayed) {
-              displayed = true;
-              WidgetsBinding.instance.addPostFrameCallback((_) {
-                if (mounted) widget.onRead?.call();
-              });
-            }
-            return child;
-          },
-          errorBuilder: (_, _, _) => const Text('图片加载失败，请检查网络'),
-        ),
       ),
     ),
   );

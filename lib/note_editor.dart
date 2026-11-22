@@ -2,7 +2,7 @@ import 'dart:ui' as ui;
 import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
 import 'data.dart';
-import 'note_edit.dart';
+import 'package:crypto/crypto.dart';
 import 'protocol.dart';
 
 enum _Tool { pen, white, text }
@@ -64,13 +64,11 @@ class _PagePainter extends CustomPainter {
 }
 
 class NoteEditor extends StatefulWidget {
-  final Session session;
   final Store store;
   final Message note;
   final int pageIndex;
   const NoteEditor({
     super.key,
-    required this.session,
     required this.store,
     required this.note,
     required this.pageIndex,
@@ -81,7 +79,7 @@ class NoteEditor extends StatefulWidget {
 
 class _NoteEditorState extends State<NoteEditor> {
   ui.Image? image;
-  NotePageEdit? edit;
+  String? originalMd5, predecessor;
   final marks = <_Mark>[];
   var tool = _Tool.pen, busy = false;
   String? error;
@@ -95,9 +93,12 @@ class _NoteEditorState extends State<NoteEditor> {
     setState(() => error = null);
     try {
       final url = widget.note.images[widget.pageIndex];
-      final bytes = await http
-          .readBytes(Uri.parse(url))
-          .timeout(const Duration(seconds: 25));
+      final local = await widget.store.localPage(widget.note, widget.pageIndex);
+      final bytes =
+          local?.bytes ??
+          await http
+              .readBytes(Uri.parse(url))
+              .timeout(const Duration(seconds: 25));
       final codec = await ui.instantiateImageCodec(bytes);
       try {
         final frame = await codec.getNextFrame();
@@ -107,7 +108,8 @@ class _NoteEditorState extends State<NoteEditor> {
         }
         setState(() {
           image = frame.image;
-          edit = NotePageEdit(widget.note, url, bytes);
+          originalMd5 = md5.convert(bytes).toString();
+          predecessor = local?.revision;
         });
       } finally {
         codec.dispose();
@@ -169,9 +171,11 @@ class _NoteEditorState extends State<NoteEditor> {
         try {
           final bytes = await result.toByteData(format: ui.ImageByteFormat.png);
           if (bytes == null) throw const ApiFailure('无法生成页面');
-          await edit!.save(
-            widget.session,
-            widget.store,
+          await widget.store.queuePage(
+            widget.note,
+            widget.pageIndex,
+            originalMd5!,
+            predecessor,
             bytes.buffer.asUint8List(bytes.offsetInBytes, bytes.lengthInBytes),
           );
         } finally {
@@ -184,7 +188,7 @@ class _NoteEditorState extends State<NoteEditor> {
     } catch (e) {
       if (mounted) {
         setState(
-          () => error = e is ApiFailure ? e.message : '未确认保存结果，请检查网络后再点保存',
+          () => error = e is ApiFailure ? e.message : '本机保存失败，请检查手机存储空间后重试',
         );
       }
     } finally {

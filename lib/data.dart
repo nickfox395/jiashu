@@ -1,4 +1,5 @@
 import 'dart:convert';
+import 'dart:typed_data';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:path/path.dart' as p;
 import 'package:sqflite/sqflite.dart';
@@ -72,6 +73,32 @@ class Vault {
     );
   }
 
+  static Future<Map<String, dynamic>?> readForm() async {
+    final raw = await storage.read(key: 'loginForm');
+    return raw == null ? null : jsonDecode(raw) as Map<String, dynamic>;
+  }
+
+  static Future<void> rememberForm(
+    String school,
+    String username,
+    String role,
+    String? password,
+    bool allowHttp,
+  ) => storage.write(
+    key: 'loginForm',
+    value: jsonEncode({
+      'school': school,
+      'username': username,
+      'role': role,
+      'password': password,
+      'allowHttp': allowHttp,
+    }),
+  );
+
+  static Future<void> forgetForm() => _writeLocked(
+    () => storage.write(key: 'loginForm', value: '{"remember":false}'),
+  );
+
   // Serialize secure-storage mutations across foreground/background engines.
   // SQLite contains only an empty lock table, never credentials or tokens.
   static Future<T> _writeLocked<T>(Future<T> Function() action) async {
@@ -88,13 +115,14 @@ class Vault {
     Session s, {
     String? password,
     bool allowHttp = false,
+    bool remember = true,
   }) => _writeLocked(() async {
     s.loginId = const Uuid().v4();
     await storage.write(
       key: 'session',
       value: jsonEncode({
         ...s.toJson(),
-        'savedPassword': password,
+        'savedPassword': remember ? password : null,
         'allowHttp': allowHttp,
       }),
     );
@@ -119,8 +147,22 @@ class Vault {
         );
         return true;
       });
-  static Future<void> clear() =>
-      _writeLocked(() => storage.delete(key: 'session'));
+  static Future<void> clear() => _writeLocked(() async {
+    // Migrate existing installations before signing out for the first time.
+    if (await readForm() == null) {
+      final saved = await readLogin();
+      if (saved != null) {
+        await rememberForm(
+          saved.session.school,
+          saved.session.username,
+          saved.session.role,
+          saved.password,
+          saved.allowHttp,
+        );
+      }
+    }
+    await storage.delete(key: 'session');
+  });
 }
 
 class Message {
@@ -148,6 +190,8 @@ class Message {
     this.deleted = false,
     this.edited = false,
   });
+  bool get canEdit =>
+      kind == 'note' && !deleted && status == 'synced' && images.isNotEmpty;
   bool get isTopic => kind == 'topic';
   bool get isUpdate => kind == 'update';
   Message withStatus(String value) => Message(
@@ -212,6 +256,14 @@ class Message {
 
 enum MessageDeleteResult { deleted, busy, notFound }
 
+class LocalPage {
+  final String revision;
+  final Uint8List bytes;
+  final bool pending;
+  final String? error;
+  const LocalPage(this.revision, this.bytes, this.pending, this.error);
+}
+
 class Store {
   final Database db;
   final String account;
@@ -219,7 +271,7 @@ class Store {
   static Future<Store> open(String account) async {
     final db = await openDatabase(
       p.join(await getDatabasesPath(), 'jiashu.db'),
-      version: 3,
+      version: 4,
       onCreate: (db, v) async {
         await db.execute(
           'CREATE TABLE messages(account TEXT,id TEXT,role TEXT,body TEXT,time INTEGER,status TEXT,source TEXT,version TEXT,unread INTEGER,images TEXT,PRIMARY KEY(account,id))',
@@ -232,6 +284,7 @@ class Store {
       onUpgrade: (db, old, version) async {
         if (old < 2) await upgradeTopics(db);
         if (old == 2) await upgradeRevisions(db);
+        if (old >= 2 && old < 4) await createPageEdits(db);
       },
     );
     return Store(db, account);
@@ -253,10 +306,127 @@ class Store {
       'CREATE INDEX messages_topic ON messages(account,topicId)',
     );
     await upgradeRevisions(db);
+    await createPageEdits(db);
   }
 
   static Future<void> upgradeRevisions(DatabaseExecutor db) => db.execute(
     "ALTER TABLE messages ADD COLUMN bodyDigest TEXT NOT NULL DEFAULT ''",
+  );
+
+  static Future<void> createPageEdits(DatabaseExecutor db) async {
+    await db.execute("""
+      CREATE TABLE page_edits(revision TEXT PRIMARY KEY, account TEXT NOT NULL,
+        noteId TEXT NOT NULL, remoteId TEXT NOT NULL, topic TEXT NOT NULL,
+        page INTEGER NOT NULL, baseUrl TEXT NOT NULL, baseMd5 TEXT NOT NULL,
+        baseDigest TEXT NOT NULL, publishedDigest TEXT, predecessor TEXT, png BLOB NOT NULL, publishedUrl TEXT, error TEXT)
+    """);
+    await db.execute(
+      'CREATE INDEX page_edits_by_note ON page_edits(account,noteId,page)',
+    );
+  }
+
+  Future<void> queuePage(
+    Message note,
+    int index,
+    String originalMd5,
+    String? predecessor,
+    Uint8List png,
+  ) async {
+    await db.transaction((tx) async {
+      if (Store.isHidden(note, await hiddenMessages(tx))) {
+        throw StateError('这份笔记已从本机移除');
+      }
+      // The editor may have stayed open while earlier local changes were confirmed.
+      var baseDigest = note.bodyDigest;
+      final published = await tx.query(
+        'page_edits',
+        columns: ['baseDigest', 'publishedDigest'],
+        where: 'account=? AND noteId=? AND publishedDigest IS NOT NULL',
+        whereArgs: [account, note.id],
+        orderBy: 'rowid',
+      );
+      for (final prior in published) {
+        if (prior['baseDigest'] == baseDigest) {
+          baseDigest = prior['publishedDigest'] as String;
+        }
+      }
+      await tx.insert('page_edits', {
+        'revision': const Uuid().v4(),
+        'account': account,
+        'noteId': note.id,
+        'remoteId': note.remoteId,
+        'topic': note.topicId,
+        'page': index,
+        'baseUrl': note.images[index],
+        'baseMd5': originalMd5,
+        'baseDigest': baseDigest,
+        'predecessor': predecessor,
+        'png': png,
+      });
+    });
+  }
+
+  // A full-resolution PNG can exceed Android's SQLite CursorWindow size.
+  Future<Uint8List> pageBytes(DatabaseExecutor tx, String revision) async {
+    final result = BytesBuilder(copy: false);
+    const chunk = 512 * 1024;
+    while (true) {
+      final rows = await tx.rawQuery(
+        'SELECT substr(png,?,?) AS bytes FROM page_edits WHERE account=? AND revision=?',
+        [result.length + 1, chunk, account, revision],
+      );
+      final bytes = rows.single['bytes'] as Uint8List;
+      result.add(bytes);
+      if (bytes.length < chunk) return result.takeBytes();
+    }
+  }
+
+  Future<LocalPage?> localPage(Message note, int index) => db.transaction((
+    tx,
+  ) async {
+    final rows = await tx.query(
+      'page_edits',
+      columns: ['revision', 'publishedUrl', 'error'],
+      where:
+          'account=? AND noteId=? AND page=? AND (publishedUrl IS NULL OR (publishedUrl=? AND publishedDigest=?))',
+      whereArgs: [account, note.id, index, note.images[index], note.bodyDigest],
+      orderBy: 'rowid DESC',
+      limit: 1,
+    );
+    if (rows.isEmpty) return null;
+    final row = rows.single, revision = row['revision'] as String;
+    return LocalPage(
+      revision,
+      await pageBytes(tx, revision),
+      row['publishedUrl'] == null,
+      row['error'] as String?,
+    );
+  });
+
+  Future<String> editBaseDigest(String revision) async =>
+      (await db.query(
+            'page_edits',
+            columns: ['baseDigest'],
+            where: 'account=? AND revision=?',
+            whereArgs: [account, revision],
+          )).single['baseDigest']
+          as String;
+
+  Future<List<Map<String, Object?>>> queuedPages() => db.query(
+    'page_edits',
+    columns: [
+      'revision',
+      'noteId',
+      'remoteId',
+      'topic',
+      'page',
+      'baseUrl',
+      'baseMd5',
+      'predecessor',
+    ],
+    where: 'account=? AND publishedUrl IS NULL',
+    whereArgs: [account],
+    orderBy: 'rowid',
   );
 
   Future<List<Message>> messages() async => (await db.query(
@@ -299,6 +469,7 @@ class Store {
     if (!await lock(lease)) return false;
     try {
       await db.transaction((tx) async {
+        await tx.delete('page_edits', where: 'account=?', whereArgs: [account]);
         await tx.rawInsert(
           """
           INSERT OR IGNORE INTO settings(account,k,v)
@@ -402,6 +573,11 @@ class Store {
           }, conflictAlgorithm: ConflictAlgorithm.replace);
         }
         for (final child in selected) {
+          await tx.delete(
+            'page_edits',
+            where: 'account=? AND noteId=?',
+            whereArgs: [account, child.id],
+          );
           await tx.rawUpdate(
             "UPDATE messages SET unread=0,status=CASE WHEN status IN ('queued','uncertain') THEN 'cancelled' ELSE status END WHERE account=? AND id=?",
             [account, child.id],
@@ -422,61 +598,66 @@ class Store {
     );
   }
 
-  Future<bool> ingest(Message m, {required bool baseline}) async =>
-      db.transaction((tx) async {
-        if (isHidden(m, await hiddenMessages(tx))) return false;
-        final rows = await tx.query(
-          'messages',
-          where: 'account=? AND id=?',
-          whereArgs: [account, m.id],
-        );
-        final old = rows.isEmpty ? null : Message.fromRow(rows.first);
-        final changed =
-            old != null &&
-            old.contentVersion.isNotEmpty &&
-            m.contentVersion.isNotEmpty &&
-            old.contentVersion != m.contentVersion;
-        final revision =
-            !baseline &&
-            !m.deleted &&
-            m.kind == 'note' &&
-            old?.status == 'synced' &&
-            old!.bodyDigest.isNotEmpty &&
-            m.bodyDigest.isNotEmpty &&
-            old.bodyDigest != m.bodyDigest;
-        final notify =
-            m.role == 'child' &&
-            !baseline &&
-            !m.deleted &&
-            (old == null || (changed && m.isTopic));
-        final row = m.row(account);
-        row['unread'] = notify || old?.unread == true ? 1 : 0;
-        row['edited'] = changed || old?.edited == true ? 1 : 0;
-        if (old != null) row['time'] = old.time;
-        await tx.insert(
-          'messages',
-          row,
-          conflictAlgorithm: ConflictAlgorithm.replace,
-        );
-        if (revision) {
-          await tx.insert(
-            'messages',
-            Message(
-              id: 'update:${const Uuid().v4()}',
-              role: 'update',
-              text: '笔记有更新：${m.text}',
-              time: DateTime.now().millisecondsSinceEpoch,
-              kind: 'update',
-              remoteId: m.remoteId,
-              topicId: m.topicId,
-              contentVersion: m.contentVersion,
-              bodyDigest: m.bodyDigest,
-              unread: true,
-            ).row(account),
-          );
-        }
-        return notify || revision;
-      });
+  Future<bool> ingest(
+    Message m, {
+    required bool baseline,
+    required String readerRole,
+  }) async => db.transaction((tx) async {
+    if (isHidden(m, await hiddenMessages(tx))) return false;
+    final rows = await tx.query(
+      'messages',
+      where: 'account=? AND id=?',
+      whereArgs: [account, m.id],
+    );
+    final old = rows.isEmpty ? null : Message.fromRow(rows.first);
+    final changed =
+        old != null &&
+        old.contentVersion.isNotEmpty &&
+        m.contentVersion.isNotEmpty &&
+        old.contentVersion != m.contentVersion;
+    final revision =
+        !baseline &&
+        !m.deleted &&
+        m.kind == 'note' &&
+        old?.status == 'synced' &&
+        old!.bodyDigest.isNotEmpty &&
+        m.bodyDigest.isNotEmpty &&
+        old.bodyDigest != m.bodyDigest;
+    final notify =
+        m.role != readerRole &&
+        !baseline &&
+        !m.deleted &&
+        (old == null || (changed && m.isTopic));
+    final row = m.row(account);
+    row['unread'] = m.role != readerRole && (notify || old?.unread == true)
+        ? 1
+        : 0;
+    row['edited'] = changed || old?.edited == true ? 1 : 0;
+    if (old != null) row['time'] = old.time;
+    await tx.insert(
+      'messages',
+      row,
+      conflictAlgorithm: ConflictAlgorithm.replace,
+    );
+    if (revision) {
+      await tx.insert(
+        'messages',
+        Message(
+          id: 'update:${const Uuid().v4()}',
+          role: 'update',
+          text: '笔记有更新：${m.text}',
+          time: DateTime.now().millisecondsSinceEpoch,
+          kind: 'update',
+          remoteId: m.remoteId,
+          topicId: m.topicId,
+          contentVersion: m.contentVersion,
+          bodyDigest: m.bodyDigest,
+          unread: true,
+        ).row(account),
+      );
+    }
+    return notify || revision;
+  });
   Future<void> markMessageRead(String id) async {
     await db.update(
       'messages',
@@ -541,13 +722,61 @@ class Store {
           .map((r) => jsonDecode(r['v'] as String) as Map<String, dynamic>)
           .toList();
 
-  Future<void> finishPageEdit(String id) async {
-    await db.delete(
+  Future<void> finishPageEdit(
+    String id, {
+    String? revision,
+    String? publishedUrl,
+    String? publishedDigest,
+  }) => db.transaction((tx) async {
+    if (revision != null && publishedUrl != null) {
+      final row = await tx.query(
+        'page_edits',
+        columns: ['noteId', 'page', 'baseDigest'],
+        where: 'account=? AND revision=?',
+        whereArgs: [account, revision],
+      );
+      if (row.isNotEmpty) {
+        await tx.update(
+          'page_edits',
+          {'baseDigest': publishedDigest},
+          where:
+              'account=? AND noteId=? AND publishedUrl IS NULL AND baseDigest=? AND revision!=?',
+          whereArgs: [
+            account,
+            row.single['noteId'],
+            row.single['baseDigest'],
+            revision,
+          ],
+        );
+        await tx.delete(
+          'page_edits',
+          where:
+              'account=? AND noteId=? AND page=? AND publishedUrl IS NOT NULL AND revision!=?',
+          whereArgs: [
+            account,
+            row.single['noteId'],
+            row.single['page'],
+            revision,
+          ],
+        );
+        await tx.update(
+          'page_edits',
+          {
+            'publishedUrl': publishedUrl,
+            'publishedDigest': publishedDigest,
+            'error': null,
+          },
+          where: 'account=? AND revision=?',
+          whereArgs: [account, revision],
+        );
+      }
+    }
+    await tx.delete(
       'settings',
       where: 'account=? AND k=?',
       whereArgs: [account, 'edit-index:$id'],
     );
-  }
+  });
 
   // Cross-isolate lease prevents foreground and background from syncing together.
   Future<bool> lock(String owner) async => db.transaction((tx) async {
