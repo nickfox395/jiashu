@@ -207,7 +207,7 @@ void main() {
     // Manual refresh also reloads local unread events even with the fixture offline.
     await tester.tap(find.byIcon(Icons.sync));
     await tester.pump(const Duration(seconds: 1));
-    expect(find.text('4 条未读家书'), findsOneWidget);
+    expect(find.text('3 条未读家书'), findsOneWidget);
     await tester.scrollUntilVisible(
       find.text('笔记有更新：辛苦啦，记得休息，晚上聊。'),
       200,

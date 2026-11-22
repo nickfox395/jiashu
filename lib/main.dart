@@ -586,7 +586,18 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
     scrollBottom();
   }
 
+  Future<void> markMessageRead(Message message) async {
+    await store!.markMessageRead(message.id);
+    await refresh();
+    if (mounted && active && unread == 0) {
+      setState(() => notified = false);
+      await Alerts.plugin.cancel(100);
+    }
+  }
+
   void openTopic(String id) {
+    final folder = topics.folders[id];
+    if (folder != null && folder.unread) unawaited(markMessageRead(folder));
     FocusScope.of(context).unfocus();
     drafts[topicId] = composer.text;
     setState(() {
@@ -996,10 +1007,7 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
                     style: TextStyle(color: muted, height: 1.7),
                   ),
                   const SizedBox(height: 16),
-                  TextButton(
-                    onPressed: settings,
-                    child: const Text('查看通路与使用说明'),
-                  ),
+                  TextButton(onPressed: settings, child: const Text('家书设置')),
                 ],
               ),
             ),
@@ -1031,11 +1039,14 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
           vertical: 10,
         ),
         leading: const Icon(Icons.forum_outlined, color: ink),
-        title: Text(
-          m.text,
-          maxLines: 2,
-          overflow: TextOverflow.ellipsis,
-          style: const TextStyle(fontWeight: FontWeight.w600),
+        title: withUnreadStar(
+          m,
+          Text(
+            m.text,
+            maxLines: 2,
+            overflow: TextOverflow.ellipsis,
+            style: const TextStyle(fontWeight: FontWeight.w600),
+          ),
         ),
         subtitle: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
@@ -1074,7 +1085,17 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
     );
   }
 
-  Future<void> openNote(Message note, {required bool edit}) async {
+  Future<void> readNote(Message note, Message message) =>
+      Navigator.of(context).push<void>(
+        MaterialPageRoute(
+          builder: (_) => _NoteReader(
+            pages: note.images,
+            onRead: message.unread ? () => markMessageRead(message) : null,
+          ),
+        ),
+      );
+
+  Future<void> editNote(Message note) async {
     final index = note.images.length == 1
         ? 0
         : await showModalBottomSheet<int>(
@@ -1092,26 +1113,6 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
             ),
           );
     if (index == null || !mounted || !active) return;
-    if (!edit) {
-      await Navigator.of(context).push<void>(
-        MaterialPageRoute(
-          builder: (_) => Scaffold(
-            appBar: AppBar(title: Text('笔记正文 · 第 ${index + 1} 页')),
-            body: Center(
-              child: InteractiveViewer(
-                minScale: .5,
-                maxScale: 5,
-                child: Image.network(
-                  note.images[index],
-                  errorBuilder: (_, _, _) => const Text('图片加载失败，请检查网络'),
-                ),
-              ),
-            ),
-          ),
-        ),
-      );
-      return;
-    }
     final saved = await Navigator.of(context).push<bool>(
       MaterialPageRoute(
         builder: (_) => NoteEditor(
@@ -1137,6 +1138,9 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
               .firstOrNull
         : null;
     final page = original ?? m;
+    final VoidCallback? read = page.images.isEmpty
+        ? null
+        : () => readNote(page, m);
     final mine = m.role == session.role, child = m.role == 'child';
     final name = m.isUpdate
         ? '笔记更新'
@@ -1175,7 +1179,7 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
                 children: [
                   Flexible(
                     child: Text(
-                      '$name  ·  ${timeLabel(m.time)}${m.edited ? ' · 已编辑' : ''}${m.unread ? '  ●' : ''}',
+                      '$name  ·  ${timeLabel(m.time)}${m.edited ? ' · 已编辑' : ''}',
                       style: const TextStyle(color: muted, fontSize: 11),
                     ),
                   ),
@@ -1187,8 +1191,10 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
                     onSelected: (action) {
                       if (action == 'delete') {
                         deleteMessage(m);
+                      } else if (action == 'edit') {
+                        editNote(page);
                       } else {
-                        openNote(page, edit: action == 'edit');
+                        read?.call();
                       }
                     },
                     itemBuilder: (_) => [
@@ -1211,18 +1217,26 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
                 ],
               ),
             ),
-            Container(
-              padding: const EdgeInsets.all(16),
-              decoration: BoxDecoration(
-                color: mine ? ink : Colors.white,
-                borderRadius: BorderRadius.circular(18),
-              ),
-              child: SelectableText(
-                m.text,
-                style: TextStyle(
-                  fontSize: 16,
-                  color: mine ? Colors.white : ink,
-                  height: 1.6,
+            GestureDetector(
+              behavior: HitTestBehavior.opaque,
+              onTap: read,
+              child: Container(
+                padding: const EdgeInsets.all(16),
+                decoration: BoxDecoration(
+                  color: mine ? ink : Colors.white,
+                  borderRadius: BorderRadius.circular(18),
+                ),
+                child: withUnreadStar(
+                  m,
+                  SelectableText(
+                    m.text,
+                    onTap: read,
+                    style: TextStyle(
+                      fontSize: 16,
+                      color: mine ? Colors.white : ink,
+                      height: 1.6,
+                    ),
+                  ),
                 ),
               ),
             ),
@@ -1241,6 +1255,86 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
       ),
     );
   }
+}
+
+Widget withUnreadStar(Message message, Widget text) {
+  if (!message.unread) return text;
+  return Row(
+    mainAxisSize: MainAxisSize.min,
+    crossAxisAlignment: CrossAxisAlignment.start,
+    children: [
+      const Padding(
+        padding: EdgeInsets.only(right: 4),
+        child: Text(
+          '*',
+          semanticsLabel: '未读',
+          style: TextStyle(
+            color: Colors.red,
+            fontSize: 18,
+            fontWeight: FontWeight.bold,
+          ),
+        ),
+      ),
+      Flexible(child: text),
+    ],
+  );
+}
+
+class _NoteReader extends StatefulWidget {
+  final List<String> pages;
+  final VoidCallback? onRead;
+  const _NoteReader({required this.pages, this.onRead});
+
+  @override
+  State<_NoteReader> createState() => _NoteReaderState();
+}
+
+class _NoteReaderState extends State<_NoteReader> {
+  int index = 0;
+  bool displayed = false;
+
+  @override
+  Widget build(BuildContext context) => Scaffold(
+    appBar: AppBar(
+      title: Text('笔记正文 · 第 ${index + 1} 页'),
+      actions: [
+        if (widget.pages.length > 1) ...[
+          IconButton(
+            tooltip: '上一页',
+            onPressed: index == 0 ? null : () => setState(() => index--),
+            icon: const Icon(Icons.chevron_left),
+          ),
+          IconButton(
+            tooltip: '下一页',
+            onPressed: index + 1 == widget.pages.length
+                ? null
+                : () => setState(() => index++),
+            icon: const Icon(Icons.chevron_right),
+          ),
+        ],
+      ],
+    ),
+    body: Center(
+      child: InteractiveViewer(
+        key: ValueKey(index),
+        minScale: .5,
+        maxScale: 5,
+        child: Image.network(
+          widget.pages[index],
+          frameBuilder: (context, child, frame, _) {
+            if (frame != null && !displayed) {
+              displayed = true;
+              WidgetsBinding.instance.addPostFrameCallback((_) {
+                if (mounted) widget.onRead?.call();
+              });
+            }
+            return child;
+          },
+          errorBuilder: (_, _, _) => const Text('图片加载失败，请检查网络'),
+        ),
+      ),
+    ),
+  );
 }
 
 String timeLabel(int milliseconds) {

@@ -477,6 +477,15 @@ class Store {
         }
         return notify || revision;
       });
+  Future<void> markMessageRead(String id) async {
+    await db.update(
+      'messages',
+      {'unread': 0},
+      where: 'account=? AND id=?',
+      whereArgs: [account, id],
+    );
+  }
+
   Future<void> markRead({String? topicId, String? topicNodeId}) async {
     await db.update(
       'messages',

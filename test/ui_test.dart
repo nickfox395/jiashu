@@ -1,8 +1,11 @@
 import 'dart:ffi';
 import 'dart:io';
+import 'dart:ui' as ui;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_background_service/flutter_background_service.dart';
+import 'package:flutter_local_notifications/flutter_local_notifications.dart'
+    show AndroidFlutterLocalNotificationsPlugin;
 import 'package:flutter_test/flutter_test.dart';
 import 'package:http/http.dart' as http;
 import 'package:http/testing.dart';
@@ -92,6 +95,7 @@ void main() {
     tester,
   ) async {
     FlutterBackgroundServiceAndroid.registerWith();
+    AndroidFlutterLocalNotificationsPlugin.registerWith();
     sqfliteFfiInit();
     if (Platform.isWindows) {
       open.overrideFor(
@@ -123,9 +127,11 @@ void main() {
           role: 'child',
           text: '消息 $i',
           time: i,
-          images: i == 40
-              ? ['https://example.test/1', 'https://example.test/2']
-              : [],
+          unread: i >= 39,
+          images: [
+            if (i >= 39) 'https://example.test/1',
+            if (i == 40) 'https://example.test/2',
+          ],
         ),
       );
     }
@@ -139,6 +145,10 @@ void main() {
         kind: 'topic',
       ),
     );
+    tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(
+      const MethodChannel('dexterous.com/flutter/local_notifications'),
+      (_) async => null,
+    );
     await store.lock('offline-test');
     await tester.pumpWidget(JiashuApp(initial: session));
     await tester.pumpAndSettle();
@@ -148,15 +158,46 @@ void main() {
     expect(find.text('消息 40').hitTestable(), findsOneWidget);
     expect(find.text('创建于 ${timeLabel(41)}').hitTestable(), findsOneWidget);
     expect(find.byType(Image), findsNothing);
-    await tester.tap(find.byKey(const ValueKey('message-menu:m40')));
+    final star = tester.widget<Text>(find.text('*').first);
+    expect(star.style?.color, Colors.red);
+    expect(find.text('2 条未读家书'), findsOneWidget);
+    final recorder = ui.PictureRecorder();
+    ui.Canvas(recorder);
+    final info = ImageInfo(image: recorder.endRecording().toImageSync(1, 1));
+    PaintingBinding.instance.imageCache.putIfAbsent(
+      const NetworkImage('https://example.test/1'),
+      () => OneFrameImageStreamCompleter(Future.value(info)),
+    );
+    await tester.tap(find.text('消息 40'));
     await tester.pumpAndSettle();
-    expect(find.text('修改笔记正文'), findsOneWidget);
-    await tester.tap(find.text('查看笔记正文'));
-    await tester.pumpAndSettle();
-    await tester.tap(find.text('第 2 页'));
+    expect(find.text('笔记正文 · 第 1 页'), findsOneWidget);
+    await tester.tap(find.byTooltip('下一页'));
     await tester.pumpAndSettle();
     expect(find.text('笔记正文 · 第 2 页'), findsOneWidget);
     await tester.pageBack();
+    await tester.pumpAndSettle();
+    expect((await store.get('m40'))!.unread, isFalse);
+    expect((await store.get('m39'))!.unread, isTrue);
+    expect(find.text('1 条未读家书'), findsOneWidget);
+    await tester.scrollUntilVisible(
+      find.text('消息 39'),
+      140,
+      scrollable: find
+          .descendant(
+            of: find.byType(ListView),
+            matching: find.byType(Scrollable),
+          )
+          .first,
+    );
+    await tester.tap(find.text('消息 39'));
+    await tester.pumpAndSettle();
+    expect(find.text('笔记正文 · 第 1 页'), findsOneWidget);
+    expect(find.byTooltip('下一页'), findsNothing);
+    await tester.pageBack();
+    await tester.pumpAndSettle();
+    expect(find.text('*'), findsNothing);
+    expect((await store.get('m39'))!.unread, isFalse);
+    controller.jumpTo(0);
     await tester.pumpAndSettle();
     await tester.tap(find.text('周末计划'));
     await tester.pumpAndSettle();
@@ -185,10 +226,6 @@ void main() {
     expect(controller.offset, 0);
     expect(find.text('刚刚发送').hitTestable(), findsOneWidget);
     await store.unlock('offline-test');
-    tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(
-      const MethodChannel('dexterous.com/flutter/local_notifications'),
-      (_) async => null,
-    );
     await tester.tap(find.byTooltip('家书设置'));
     await tester.pumpAndSettle();
     expect(find.text('后台接收与新消息提醒'), findsOneWidget);
