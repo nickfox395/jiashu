@@ -311,7 +311,7 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
           (currentTopic != null &&
               !currentTopic!.deleted &&
               currentTopic!.status != 'conflict'));
-  String notesStatus = '正在连接云笔记…', columnsStatus = '在线专栏待检查', lastSync = '尚未同步';
+  String notesStatus = '正在连接云笔记…', lastSync = '尚未同步';
   bool syncing = false,
       deleting = false,
       foreground = true,
@@ -343,7 +343,7 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
       await refresh();
       if (count > 0 && foreground) announce(count);
     });
-    await sync(checkColumns: true);
+    await sync();
     if (!active) return;
     timer = Timer.periodic(const Duration(seconds: 30), (_) async {
       if (!foreground || !active) return;
@@ -383,31 +383,23 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
       if (old[m.id] != null && old[m.id]!.contentVersion != m.contentVersion) {
         for (final url in m.images) {
           await NetworkImage(url).evict();
-          // Image.network(cacheWidth: 800) uses a separate ResizeImage cache key.
-          await ResizeImage.resizeIfNeeded(
-            800,
-            null,
-            NetworkImage(url),
-          ).evict();
         }
       }
     }
     final ns = await store!.setting('notesStatus'),
-        cs = await store!.setting('columnsStatus'),
         ls = await store!.setting('lastSync');
     if (!mounted || !active || generation != refreshGeneration) return;
     setState(() {
       messages = list;
       unread = list.where((m) => m.unread).length;
       notesStatus = ns ?? notesStatus;
-      columnsStatus = cs ?? columnsStatus;
       lastSync = ls == null
           ? '尚未同步'
           : timeLabel(DateTime.parse(ls).millisecondsSinceEpoch);
     });
   }
 
-  Future<void> sync({bool checkColumns = false}) async {
+  Future<void> sync() async {
     if (store == null || syncing || deleting || !active) return;
     setState(() => syncing = true);
     try {
@@ -415,7 +407,7 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
         session,
         store!,
         isActive: () => active,
-      ).run(checkColumns: checkColumns);
+      ).run();
       if (!active) return;
       await Alerts.authentication(session, store!, result);
       await refresh();
@@ -736,70 +728,17 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
                 '${session.username} · ${session.school} · ${session.roleName}',
                 style: const TextStyle(color: muted),
               ),
-              const Padding(
-                padding: EdgeInsets.only(top: 10),
-                child: Text(
-                  '密码加密保存在本机，用于登录过期后自动恢复。退出登录会清除保存的密码。旧版升级后请先重新登录一次。',
-                  style: TextStyle(fontSize: 12, color: muted, height: 1.6),
-                ),
-              ),
               SwitchListTile(
                 contentPadding: EdgeInsets.zero,
                 title: const Text('后台接收与新消息提醒'),
-                subtitle: const Text('通知栏持续显示接收状态，约每 3 分钟检查一次'),
+                subtitle: const Text('每 3 分钟检查一次新消息'),
                 value: background,
                 onChanged: (v) async {
                   await toggleBackground(v);
-                  update(() {});
+                  if (context.mounted) update(() {});
                 },
               ),
-              const Text(
-                '打开聊天时约每 30 秒检查；失败会延长间隔。孩子需要在云笔记保存并同步。手机限制后台、断网或强行停止应用时，不能保证及时提醒。',
-                style: TextStyle(fontSize: 12, color: muted, height: 1.6),
-              ),
-              const Divider(height: 32),
-              const Text(
-                '两条通路',
-                style: TextStyle(fontWeight: FontWeight.bold, fontSize: 17),
-              ),
-              ListTile(
-                contentPadding: EdgeInsets.zero,
-                leading: const Icon(Icons.cloud_outlined),
-                title: const Text('中育云笔记'),
-                subtitle: Text(notesStatus),
-              ),
-              ListTile(
-                contentPadding: EdgeInsets.zero,
-                leading: const Icon(Icons.article_outlined),
-                title: const Text('在线专栏 · 待接通'),
-                subtitle: Text('$columnsStatus\n尚未验证私有页面与回信格式，此版本不向专栏发送消息。'),
-              ),
-              OutlinedButton.icon(
-                onPressed: syncing
-                    ? null
-                    : () async {
-                        await sync(checkColumns: true);
-                        update(() {});
-                      },
-                icon: const Icon(Icons.refresh),
-                label: const Text('重新检查通路'),
-              ),
-              const Divider(height: 32),
-              const Text(
-                '孩子怎么回复？',
-                style: TextStyle(fontSize: 17, fontWeight: FontWeight.bold),
-              ),
-              const SizedBox(height: 10),
-              const Text(
-                '1. 打开中育云笔记并同步，进入「家书」。\n2. 文件夹就是话题，文件夹名称也能表达消息。\n3. 进入想聊的话题，新建笔记写回复，保存并同步。\n4. 同一文件夹里的每条笔记都是独立发言，不用为每次回复新建文件夹。\n5. 想另开分支时，新建子文件夹，并在里面继续写笔记。\n\n也可以直接在原笔记续写，保存并同步。家书会新增一条“笔记有更新”未读消息；因共用账号，无法区分修改者。家书根目录的旧笔记也会保留。',
-                style: TextStyle(height: 1.7, color: ink),
-              ),
-              const SizedBox(height: 16),
-              const Text(
-                '状态“服务器已保存”不代表孩子已看见。两个通路共用学校账号；账号整体被限制时，两者都可能不可用。',
-                style: TextStyle(fontSize: 12, color: muted, height: 1.6),
-              ),
-              const SizedBox(height: 16),
+              const Divider(),
               TextButton.icon(
                 onPressed: store == null || deleting
                     ? null
@@ -816,7 +755,7 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
                   logout();
                 },
                 icon: const Icon(Icons.logout),
-                label: const Text('退出登录（本机聊天记录保留）'),
+                label: const Text('退出登录'),
               ),
             ],
           ),
@@ -870,7 +809,7 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
                 : const Icon(Icons.sync),
           ),
           IconButton(
-            tooltip: '设置与孩子回复说明',
+            tooltip: '家书设置',
             onPressed: settings,
             icon: const Icon(Icons.tune),
           ),
@@ -1135,7 +1074,7 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
     );
   }
 
-  Future<void> editNote(Message note) async {
+  Future<void> openNote(Message note, {required bool edit}) async {
     final index = note.images.length == 1
         ? 0
         : await showModalBottomSheet<int>(
@@ -1146,13 +1085,33 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
                 shrinkWrap: true,
                 itemCount: note.images.length,
                 itemBuilder: (context, i) => ListTile(
-                  title: Text('编辑第 ${i + 1} 页'),
+                  title: Text('第 ${i + 1} 页'),
                   onTap: () => Navigator.pop(context, i),
                 ),
               ),
             ),
           );
     if (index == null || !mounted || !active) return;
+    if (!edit) {
+      await Navigator.of(context).push<void>(
+        MaterialPageRoute(
+          builder: (_) => Scaffold(
+            appBar: AppBar(title: Text('笔记正文 · 第 ${index + 1} 页')),
+            body: Center(
+              child: InteractiveViewer(
+                minScale: .5,
+                maxScale: 5,
+                child: Image.network(
+                  note.images[index],
+                  errorBuilder: (_, _, _) => const Text('图片加载失败，请检查网络'),
+                ),
+              ),
+            ),
+          ),
+        ),
+      );
+      return;
+    }
     final saved = await Navigator.of(context).push<bool>(
       MaterialPageRoute(
         builder: (_) => NoteEditor(
@@ -1226,13 +1185,18 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
                     enabled: !syncing && !deleting,
                     icon: const Icon(Icons.more_horiz, size: 20, color: muted),
                     onSelected: (action) {
-                      if (action == 'edit') {
-                        editNote(page);
-                      } else {
+                      if (action == 'delete') {
                         deleteMessage(m);
+                      } else {
+                        openNote(page, edit: action == 'edit');
                       }
                     },
                     itemBuilder: (_) => [
+                      if (page.images.isNotEmpty)
+                        const PopupMenuItem(
+                          value: 'view',
+                          child: Text('查看笔记正文'),
+                        ),
                       if (page.kind == 'note' &&
                           !page.deleted &&
                           page.status == 'synced' &&
@@ -1253,68 +1217,13 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
                 color: mine ? ink : Colors.white,
                 borderRadius: BorderRadius.circular(18),
               ),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  SelectableText(
-                    m.text,
-                    style: TextStyle(
-                      fontSize: 16,
-                      color: mine ? Colors.white : ink,
-                      height: 1.6,
-                    ),
-                  ),
-                  if (m.isUpdate)
-                    const Padding(
-                      padding: EdgeInsets.only(top: 8),
-                      child: Text(
-                        '下方为笔记最新页面；修改者无法区分',
-                        style: TextStyle(fontSize: 12),
-                      ),
-                    ),
-                  for (final image in page.images)
-                    Padding(
-                      padding: const EdgeInsets.only(top: 10),
-                      child: InkWell(
-                        onTap: () => Navigator.of(context).push(
-                          MaterialPageRoute(
-                            builder: (_) => Scaffold(
-                              appBar: AppBar(title: const Text('消息笔记')),
-                              body: Center(
-                                child: InteractiveViewer(
-                                  minScale: .5,
-                                  maxScale: 5,
-                                  child: Image.network(
-                                    image,
-                                    key: ValueKey(
-                                      '${m.id}:${page.contentVersion}:$image',
-                                    ),
-                                    errorBuilder: (_, _, _) =>
-                                        const Text('图片加载失败，请检查网络'),
-                                  ),
-                                ),
-                              ),
-                            ),
-                          ),
-                        ),
-                        child: Image.network(
-                          image,
-                          key: ValueKey(
-                            '${m.id}:${page.contentVersion}:$image',
-                          ),
-                          cacheWidth: 800,
-                          loadingBuilder: (context, child, loading) =>
-                              loading == null
-                              ? child
-                              : const Padding(
-                                  padding: EdgeInsets.all(20),
-                                  child: LinearProgressIndicator(),
-                                ),
-                          errorBuilder: (_, _, _) => const Text('页面图片加载失败'),
-                        ),
-                      ),
-                    ),
-                ],
+              child: SelectableText(
+                m.text,
+                style: TextStyle(
+                  fontSize: 16,
+                  color: mine ? Colors.white : ink,
+                  height: 1.6,
+                ),
               ),
             ),
             Padding(

@@ -118,7 +118,15 @@ void main() {
     });
     for (var i = 1; i <= 40; i++) {
       await store.put(
-        Message(id: 'm$i', role: 'child', text: '消息 $i', time: i),
+        Message(
+          id: 'm$i',
+          role: 'child',
+          text: '消息 $i',
+          time: i,
+          images: i == 40
+              ? ['https://example.test/1', 'https://example.test/2']
+              : [],
+        ),
       );
     }
     await store.put(
@@ -139,6 +147,17 @@ void main() {
         .controller!;
     expect(find.text('消息 40').hitTestable(), findsOneWidget);
     expect(find.text('创建于 ${timeLabel(41)}').hitTestable(), findsOneWidget);
+    expect(find.byType(Image), findsNothing);
+    await tester.tap(find.byKey(const ValueKey('message-menu:m40')));
+    await tester.pumpAndSettle();
+    expect(find.text('修改笔记正文'), findsOneWidget);
+    await tester.tap(find.text('查看笔记正文'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('第 2 页'));
+    await tester.pumpAndSettle();
+    expect(find.text('笔记正文 · 第 2 页'), findsOneWidget);
+    await tester.pageBack();
+    await tester.pumpAndSettle();
     await tester.tap(find.text('周末计划'));
     await tester.pumpAndSettle();
     expect(find.text('妈妈开启 · ${timeLabel(41)}'), findsOneWidget);
@@ -170,8 +189,12 @@ void main() {
       const MethodChannel('dexterous.com/flutter/local_notifications'),
       (_) async => null,
     );
-    await tester.tap(find.byTooltip('设置与孩子回复说明'));
+    await tester.tap(find.byTooltip('家书设置'));
     await tester.pumpAndSettle();
+    expect(find.text('后台接收与新消息提醒'), findsOneWidget);
+    expect(find.text('退出登录'), findsOneWidget);
+    expect(find.text('重新检查通路'), findsNothing);
+    expect(find.text('孩子怎么回复？'), findsNothing);
     await tester.ensureVisible(find.text('清空聊天记录'));
     await tester.tap(find.text('清空聊天记录'));
     await tester.pumpAndSettle();

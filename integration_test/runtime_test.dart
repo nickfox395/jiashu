@@ -213,7 +213,7 @@ void main() {
       200,
       scrollable: find.byType(Scrollable).first,
     );
-    expect(find.text('下方为笔记最新页面；修改者无法区分'), findsOneWidget);
+    expect(find.byType(Image), findsNothing);
     expect(tester.takeException(), isNull);
     await binding.convertFlutterSurfaceToImage();
     await tester.pump();
@@ -314,7 +314,7 @@ void main() {
     expect(find.text('话题与日常消息'), findsOneWidget);
     expect(find.text('今天的校园生活'), findsNothing);
     expect((await store.visibleMessages()).single.id, 'old-history');
-    await tester.tap(find.byTooltip('设置与孩子回复说明'));
+    await tester.tap(find.byTooltip('家书设置'));
     await tester.pumpAndSettle();
     await tester.ensureVisible(find.text('清空聊天记录'));
     await tester.tap(find.text('清空聊天记录'));
